@@ -2,4 +2,3 @@
 *.bin filter=lfs diff=lfs merge=lfs -text
 *.safetensors filter=lfs diff=lfs merge=lfs -text
 *.h5 filter=lfs diff=lfs merge=lfs -text
-fine_tuned104/best_indobert_summarizer.pt filter=lfs diff=lfs merge=lfs -text
