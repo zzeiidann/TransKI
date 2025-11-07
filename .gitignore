@@ -1,0 +1,4 @@
+*.pt
+*.bin
+*.safetensors
+indobert-lite-base-p1/
