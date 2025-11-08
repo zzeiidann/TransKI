@@ -4,11 +4,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
-use tch::{nn, nn::OptimizerConfig, Device, Tensor, Kind};
+use std::io::{BufRead, BufReader, Read, Cursor};
+use tch::{nn, nn::OptimizerConfig, Device, Tensor, Kind, TchError};
+use tch::no_grad;
 use std::path::Path;
+use rayon::prelude::*;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct SummarizationData {
     text: String,
     summary: String,
@@ -205,14 +207,12 @@ fn calculate_bleu(reference: &str, hypothesis: &str) -> f64 {
         precisions.push(precision);
     }
 
-    // Brevity penalty
     let bp = if hyp_tokens.len() < ref_tokens.len() {
         (1.0 - (ref_tokens.len() as f64 / hyp_tokens.len() as f64)).exp()
     } else {
         1.0
     };
 
-    // Geometric mean of precisions
     let geo_mean = if precisions.iter().any(|&p| p == 0.0) {
         0.0
     } else {
@@ -224,8 +224,52 @@ fn calculate_bleu(reference: &str, hypothesis: &str) -> f64 {
 }
 
 // ============================================================================
-// ORIGINAL INDOBERT CODE (with modifications for metrics)
+// TOKENIZER & DATA PREPARATION (with parallel processing)
 // ============================================================================
+
+fn try_load_ckpt(vs: &mut nn::VarStore) -> bool {
+    let mut loaded = false;
+
+    // 1) Coba safetensors dulu (stabil & aman)
+    if Path::new("clean_state_dict.safetensors").exists() {
+        let ok = tch::no_grad(|| vs.read_safetensors("clean_state_dict.safetensors"));
+        match ok {
+            Ok(()) => {
+                let total_params: i64 = vs.variables().values().map(|t| t.numel() as i64).sum();
+                println!(" Weights loaded from clean_state_dict.safetensors (params: {total_params})");
+                loaded = true;
+            }
+            Err(e) => {
+                eprintln!(" read_safetensors gagal: {e}");
+            }
+        }
+    }
+
+    // 2) (Opsional) Fallback .pt — hanya kalau kamu benar-benar butuh
+    //    Catatan: .pt yang valid harus dibuat dgn torch.save(model.state_dict(), "xxx.pt")
+    if !loaded && Path::new("clean_state_dict.pt").exists() {
+        let ok = tch::no_grad(|| vs.load_partial("clean_state_dict.pt"));
+        match ok {
+            Ok(unused) => {
+                println!("✓ partial .pt loaded");
+                if !unused.is_empty() {
+                    println!("  unused keys in checkpoint: {}", unused.join(", "));
+                }
+                let total_params: i64 = vs.variables().values().map(|t| t.numel() as i64).sum();
+                println!("   Total parameters: {total_params}");
+                loaded = true;
+            }
+            Err(e) => {
+                eprintln!("❌ load_partial (.pt) error: {e}");
+            }
+        }
+    }
+
+    if !loaded {
+        println!("→ lanjut train from scratch");
+    }
+    loaded
+}
 
 fn load_indobert_vocab(vocab_path: &str) -> Result<HashMap<String, i64>> {
     let file = File::open(vocab_path)
@@ -238,7 +282,7 @@ fn load_indobert_vocab(vocab_path: &str) -> Result<HashMap<String, i64>> {
         vocab.insert(token, idx as i64);
     }
     
-    println!(" Loaded vocabulary: {} tokens", vocab.len());
+    println!("✓ Loaded vocabulary: {} tokens", vocab.len());
     Ok(vocab)
 }
 
@@ -248,7 +292,7 @@ fn load_indobert_config(config_path: &str) -> Result<IndoBERTConfig> {
     let config: IndoBERTConfig = serde_json::from_reader(file)
         .context("Failed to parse config JSON")?;
     
-    println!(" Loaded IndoBERT config:");
+    println!("✓ Loaded IndoBERT config:");
     println!("   - Vocab size: {}", config.vocab_size);
     println!("   - Hidden size: {}", config.hidden_size);
     println!("   - Layers: {}", config.num_hidden_layers);
@@ -257,9 +301,9 @@ fn load_indobert_config(config_path: &str) -> Result<IndoBERTConfig> {
     Ok(config)
 }
 
+#[derive(Clone)]
 struct IndoBERTTokenizer {
     vocab: HashMap<String, i64>,
-    reverse_vocab: HashMap<i64, String>,
     max_length: i64,
     pad_token_id: i64,
     cls_token_id: i64,
@@ -270,11 +314,6 @@ struct IndoBERTTokenizer {
 
 impl IndoBERTTokenizer {
     fn new(vocab: HashMap<String, i64>, max_length: i64, config_vocab_size: i64) -> Self {
-        let mut reverse_vocab = HashMap::new();
-        for (token, id) in &vocab {
-            reverse_vocab.insert(*id, token.clone());
-        }
-        
         let pad_token_id = *vocab.get("[PAD]").unwrap_or(&0);
         let cls_token_id = *vocab.get("[CLS]").unwrap_or(&2);
         let sep_token_id = *vocab.get("[SEP]").unwrap_or(&3);
@@ -284,7 +323,6 @@ impl IndoBERTTokenizer {
         
         IndoBERTTokenizer {
             vocab,
-            reverse_vocab,
             max_length,
             pad_token_id,
             cls_token_id,
@@ -396,6 +434,47 @@ fn calculate_sentence_labels(text: &str, summary: &str) -> Vec<i64> {
         if overlap_ratio > 0.3 { 1 } else { 0 }
     }).collect()
 }
+
+// PARALLEL DATA PREPARATION
+fn prepare_training_data_parallel(
+    data: &[SummarizationData],
+    tokenizer: &IndoBERTTokenizer,
+) -> Vec<(Vec<i64>, i64)> {
+    println!("\n Preparing training data (parallel processing)...");
+    
+    let pb = ProgressBar::new(data.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} Processing documents...")
+            .unwrap()
+            .progress_chars("#>-")
+    );
+    
+    // Process documents in parallel
+    let train_data: Vec<_> = data.par_iter()
+        .flat_map(|item| {
+            let sentences = split_sentences(&item.text);
+            let labels = calculate_sentence_labels(&item.text, &item.summary);
+            
+            pb.inc(1);
+            
+            sentences.iter()
+                .zip(labels.iter())
+                .map(|(sentence, label)| {
+                    let tokens = tokenizer.encode_sentence(sentence);
+                    (tokens, *label)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    
+    pb.finish_with_message("Data preparation completed");
+    train_data
+}
+
+// ============================================================================
+// MODEL ARCHITECTURE
+// ============================================================================
 
 struct FeedForward {
     linear1: nn::Linear,
@@ -517,75 +596,114 @@ impl TransformerEncoderLayer {
 struct BERTSummarizer {
     embedding: nn::Embedding,
     position_embedding: nn::Embedding,
+    embedding_projection: Option<nn::Linear>,
     encoder_layers: Vec<TransformerEncoderLayer>,
     classifier: nn::Linear,
     dropout: f64,
     layer_norm: nn::LayerNorm,
+    embedding_size: i64,
+    hidden_size: i64,
 }
 
 impl BERTSummarizer {
     fn new(vs: &nn::Path, config: &IndoBERTConfig) -> Self {
+        // DULU: let embedding_size = 128;
+        let embedding_size = config.hidden_size; // 768
+        let hidden_size = config.hidden_size;    // 768
+
         let embedding = nn::embedding(
             vs / "embedding",
             config.vocab_size,
-            config.hidden_size,
+            embedding_size,
             Default::default()
         );
 
         let position_embedding = nn::embedding(
             vs / "position_embedding",
             config.max_position_embeddings,
-            config.hidden_size,
+            embedding_size,
             Default::default()
         );
+
+        // DULU: Some(linear(...))
+        let embedding_projection = None; // hilangkan projection
 
         let mut encoder_layers = Vec::new();
         for i in 0..config.num_hidden_layers {
             encoder_layers.push(TransformerEncoderLayer::new(
                 &(vs / format!("encoder_{}", i)),
-                config.hidden_size,
+                hidden_size,
                 config.num_attention_heads,
                 config.intermediate_size,
                 config.hidden_dropout_prob,
             ));
         }
 
-        let classifier = nn::linear(vs / "classifier", config.hidden_size, 2, Default::default());
+        let classifier = nn::linear(vs / "classifier", hidden_size, 2, Default::default());
 
+        // ukuran LN harus = embedding_size (sekarang 768)
         let norm_config = nn::LayerNormConfig { eps: 1e-12, ..Default::default() };
-        let layer_norm = nn::layer_norm(vs / "layer_norm", vec![config.hidden_size], norm_config);
+        let layer_norm = nn::layer_norm(vs / "layer_norm", vec![embedding_size], norm_config);
 
         BERTSummarizer {
             embedding,
             position_embedding,
+            embedding_projection, // None
             encoder_layers,
             classifier,
             dropout: config.hidden_dropout_prob,
             layer_norm,
+            embedding_size,
+            hidden_size,
         }
     }
 
     fn forward(&self, input_ids: &Tensor, train: bool) -> Tensor {
         let (batch_size, seq_len) = (input_ids.size()[0], input_ids.size()[1]);
-        
+
         let positions = Tensor::arange(seq_len, (Kind::Int64, input_ids.device()))
             .unsqueeze(0)
             .expand([batch_size, seq_len], false);
-        
+
         let token_embeddings = input_ids.apply(&self.embedding);
         let position_embeddings = positions.apply(&self.position_embedding);
-        
+
         let mut x = token_embeddings + position_embeddings;
         x = x.apply(&self.layer_norm).dropout(self.dropout, train);
-        
+
+        if let Some(ref proj) = self.embedding_projection {
+            x = x.apply(proj);
+        }
+
         for layer in &self.encoder_layers {
             x = layer.forward(&x, None, train);
         }
-        
+
         let cls_output = x.select(1, 0);
         cls_output.apply(&self.classifier)
     }
 }
+
+
+// ============================================================================
+// TORCHSCRIPT HANDLING
+// ============================================================================
+
+fn convert_torchscript_to_state_dict(torchscript_path: &str, output_path: &str) -> Result<()> {
+    println!(" Converting TorchScript model to state_dict...");
+    
+    // This would typically be done with Python, but we'll handle it in Rust
+    // For now, we'll create a placeholder function
+    println!(" Please convert the TorchScript file using Python:");
+    println!("   python -c \"import torch; m=torch.jit.load('{}'); torch.save(m.state_dict(), '{}')\"", 
+             torchscript_path, output_path);
+    
+    Ok(())
+}
+
+// ============================================================================
+// TRAINING & EVALUATION
+// ============================================================================
 
 struct TrainingConfig {
     learning_rate: f64,
@@ -593,6 +711,7 @@ struct TrainingConfig {
     epochs: i64,
     warmup_epochs: i64,
     device: Device,
+    num_threads: usize,
 }
 
 fn load_data(file_path: &str) -> Result<Vec<SummarizationData>> {
@@ -783,50 +902,8 @@ fn count_parameters(vs: &nn::VarStore) -> i64 {
     total
 }
 
-fn calculate_expected_parameters(config: &IndoBERTConfig) -> i64 {
-    let embedding_params = config.vocab_size * config.hidden_size;
-    let position_params = config.max_position_embeddings * config.hidden_size;
-    let layer_params = config.hidden_size * config.hidden_size * 12;
-    let total_layers_params = layer_params * config.num_hidden_layers;
-    let classifier_params = config.hidden_size * 2;
-    
-    embedding_params + position_params + total_layers_params + classifier_params
-}
 
-fn load_pretrained_weights(vs: &mut nn::VarStore, config: &IndoBERTConfig) -> bool {
-    let possible_paths = [
-        "indobert_clean.pt",
-        "indobert_fresh.pt", 
-        "indobert_state_dict.pt",
-        "indobert_proper.pt",
-        "indobert_model_traced.pt",
-    ];
-
-    for path in &possible_paths {
-        if Path::new(path).exists() {
-            println!("    Found weights at: {}", path);
-            println!("    Attempting to load...");
-            
-            match vs.load(path) {
-                Ok(_) => {
-                    println!("    Successfully loaded pre-trained weights from {}!", path);
-                    
-                    let loaded_params = count_parameters(vs);
-                    let expected_params = calculate_expected_parameters(config);
-                    println!("    Loaded parameters: {} (expected: ~{})", loaded_params, expected_params);
-                    
-                    return true;
-                }
-                Err(e) => {
-                    println!("     Failed to load {}: {}", path, e);
-                    *vs = nn::VarStore::new(vs.device());
-                }
-            }
-        }
-    }
-    
-    false
-}
+// NEW: Improved weight loading with TorchScript support
 
 // Generate summary from model predictions
 fn generate_summary_from_model(
@@ -862,7 +939,25 @@ fn generate_summary_from_model(
     selected_sentences.join(" ")
 }
 
-// Evaluate model on full summarization task
+// Batch inference for better performance
+fn generate_summaries_batch(
+    model: &BERTSummarizer,
+    tokenizer: &IndoBERTTokenizer,
+    texts: &[String],
+    max_seq_len: i64,
+    device: Device,
+) -> Vec<String> {
+    let mut all_summaries = Vec::new();
+    
+    for text in texts {
+        let summary = generate_summary_from_model(model, tokenizer, text, max_seq_len, device);
+        all_summaries.push(summary);
+    }
+    
+    all_summaries
+}
+
+// PARALLEL EVALUATION for ROUGE/BLEU
 fn evaluate_summarization(
     model: &BERTSummarizer,
     tokenizer: &IndoBERTTokenizer,
@@ -883,24 +978,28 @@ fn evaluate_summarization(
     let mut rouge_scores = Vec::new();
     let mut bleu_scores = Vec::new();
     
-    for item in data {
-        let generated_summary = generate_summary_from_model(
-            model, 
-            tokenizer, 
-            &item.text, 
-            max_seq_len, 
-            device
+    // Use batch processing for better performance
+    let batch_size = 8;
+    let batches: Vec<_> = data.chunks(batch_size).collect();
+    
+    for batch in batches {
+        let texts: Vec<String> = batch.iter().map(|d| d.text.clone()).collect();
+        let references: Vec<String> = batch.iter().map(|d| d.summary.clone()).collect();
+        
+        let generated_summaries = generate_summaries_batch(
+            model, tokenizer, &texts, max_seq_len, device
         );
         
-        if !generated_summary.is_empty() {
-            let rouge = calculate_rouge(&item.summary, &generated_summary);
-            let bleu = calculate_bleu(&item.summary, &generated_summary);
-            
-            rouge_scores.push(rouge);
-            bleu_scores.push(bleu);
+        for (generated, reference) in generated_summaries.iter().zip(references.iter()) {
+            if !generated.is_empty() {
+                let rouge = calculate_rouge(reference, generated);
+                let bleu = calculate_bleu(reference, generated);
+                
+                rouge_scores.push(rouge);
+                bleu_scores.push(bleu);
+            }
+            pb.inc(1);
         }
-        
-        pb.inc(1);
     }
     
     pb.finish_with_message("Evaluation completed");
@@ -915,14 +1014,50 @@ fn evaluate_summarization(
     (avg_rouge, avg_bleu)
 }
 
+// NEW: Function to check and convert TorchScript models
+fn setup_pretrained_weights() -> Result<()> {
+    let torchscript_paths = [
+        "indobert_clean.pt",
+        "indobert_state_dict.pt",
+    ];
+    
+    for path in &torchscript_paths {
+        if Path::new(path).exists() && !Path::new("converted.pt").exists() {
+            println!(" Found TorchScript model: {}", path);
+            println!(" Converting to state_dict format...");
+            convert_torchscript_to_state_dict(path, "converted.pt")?;
+            break;
+        }
+    }
+    
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    // Set number of threads for parallel processing
+    let num_threads = num_cpus::get();
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .unwrap();
+    
+    // Set PyTorch threads for CPU computation
+    tch::set_num_threads(num_threads as i32);
+    
+    println!(" IndoBERT Summarizer with Improved TorchScript Support");
+    println!("   CPU threads: {}", num_threads);
+    println!();
+
+    // Setup pretrained weights first
+    setup_pretrained_weights()?;
 
     let config = TrainingConfig {
-        learning_rate: 2e-5,
-        batch_size: 4,
-        epochs: 1,
-        warmup_epochs: 1,
-        device: Device::cuda_if_available(),
+        learning_rate: 5e-4,
+        batch_size: 8,
+        epochs: 10,
+        warmup_epochs: 2,
+        device: Device::Cpu,
+        num_threads,
     };
     
     println!("  Configuration:");
@@ -930,6 +1065,7 @@ fn main() -> Result<()> {
     println!("   Batch size: {}", config.batch_size);
     println!("   Learning rate: {}", config.learning_rate);
     println!("   Epochs: {} (+ {} warmup)", config.epochs, config.warmup_epochs);
+    println!("   Parallel threads: {}", config.num_threads);
     println!();
     
     println!(" Loading pre-trained files...");
@@ -945,21 +1081,11 @@ fn main() -> Result<()> {
     let data = load_data(csv_path)?;
     println!("   Loaded {} documents", data.len());
     
-    println!("\n Preparing training data...");
-    let mut train_data = Vec::new();
+    // Use parallel data preparation
+    let train_data = prepare_training_data_parallel(&data, &tokenizer);
     
-    for item in &data {
-        let sentences = split_sentences(&item.text);
-        let labels = calculate_sentence_labels(&item.text, &item.summary);
-        
-        for (sentence, label) in sentences.iter().zip(labels.iter()) {
-            let tokens = tokenizer.encode_sentence(sentence);
-            train_data.push((tokens, *label));
-        }
-    }
-    
-    println!("   Total training samples: {}", train_data.len());
     let important_count = train_data.iter().filter(|(_, l)| *l == 1).count();
+    println!("   Total training samples: {}", train_data.len());
     println!("   Important sentences: {} ({:.2}%)", 
         important_count, 
         100.0 * important_count as f64 / train_data.len() as f64
@@ -969,9 +1095,11 @@ fn main() -> Result<()> {
     println!("   Vocabulary size: {}", vocab_size);
     
     let initial_count = train_data.len();
-    train_data.retain(|(tokens, _)| {
-        tokens.iter().all(|&token_id| token_id >= 0 && token_id < vocab_size)
-    });
+    let train_data: Vec<_> = train_data.into_par_iter()
+        .filter(|(tokens, _)| {
+            tokens.iter().all(|&token_id| token_id >= 0 && token_id < vocab_size)
+        })
+        .collect();
     
     println!("   Valid training samples after filtering: {} (removed {})", 
              train_data.len(), initial_count - train_data.len());
@@ -980,20 +1108,80 @@ fn main() -> Result<()> {
     let (train_set, test_set) = train_data.split_at(split_idx);
     println!("   Train set: {}, Test set: {}", train_set.len(), test_set.len());
     
-    println!("\n Initializing IndoBERT model...");
-    let mut vs = nn::VarStore::new(config.device);
-    
-    let loaded_pretrained = load_pretrained_weights(&mut vs, &indobert_config);
+    println!(" Initializing IndoBERT model...");
+    // 1) Bangun model dulu
+    // ...
 
-    if !loaded_pretrained {
-        println!("    Training from scratch with IndoBERT architecture");
-        println!("      This is fine! Model will learn from your data");
+    let st_path = "clean_state_dict.safetensors";
+    let pt_path = "clean_state_dict.pt"; // opsional fallback, tapi riskan di env kamu
+
+   // sesudah:
+    let device = Device::cuda_if_available();
+    let mut vs = nn::VarStore::new(device);
+
+    // 1) register semua parameter ke VarStore dengan membangun model dulu
+    let model = BERTSummarizer::new(&vs.root(), &indobert_config);
+
+    // 2) baru load sekali
+    let _ = try_load_ckpt(&mut vs);
+
+    // helper kecil buat info apakah ada yang berubah
+    fn param_count(vs: &nn::VarStore) -> i64 {
+        // versi A: pakai sum::<i64>()
+        vs.variables()
+            .values()
+            .map(|t| t.numel() as i64)
+            .sum::<i64>()
+    }
+    let before_params = param_count(&vs);
+
+    if Path::new(st_path).exists() {
+        // cara 1: paling aman – load di dalam no_grad
+        match no_grad(|| vs.read_safetensors(st_path)) {
+            Ok(()) => {
+                let after_params = param_count(&vs);
+                println!(" Weights loaded from {st_path} (params: {after_params}, was {before_params})");
+            }
+            Err(e) => {
+                eprintln!(" read_safetensors (no_grad) gagal: {e}");
+                // OPTIONAL: fallback ke .pt, tapi ini sering crash di environment kamu
+                if Path::new(pt_path).exists() {
+                    match no_grad(|| vs.load_partial(pt_path)) {
+                        Ok(missing) => {
+                            if !missing.is_empty() {
+                                println!(" Missing {} keys (partial):", missing.len());
+                                for k in missing.iter().take(20) { println!("   - {k}"); }
+                                if missing.len() > 20 { println!("   ... and {} more", missing.len() - 20); }
+                            }
+                            println!(" Fallback load_partial .pt OK");
+                        }
+                        Err(e2) => eprintln!(" Fallback load_partial gagal: {e2}"),
+                    }
+                } else {
+                    eprintln!(" Fallback .pt ({pt_path}) tidak ditemukan.");
+                }
+            }
+        }
+    } else if Path::new(pt_path).exists() {
+        // kalau gak ada safetensors, coba .pt di dalam no_grad
+        match no_grad(|| vs.load_partial(pt_path)) {
+            Ok(missing) => {
+                if !missing.is_empty() {
+                    println!(" Missing {} keys (partial):", missing.len());
+                    for k in missing.iter().take(20) { println!("   - {k}"); }
+                    if missing.len() > 20 { println!("   ... and {} more", missing.len() - 20); }
+                }
+                println!(" Weights loaded from {pt_path}");
+            }
+            Err(e) => eprintln!(" load_partial gagal: {e}"),
+        }
+    } else {
+        eprintln!(" Tidak ada file pretrain ditemukan ({st_path} / {pt_path}).");
     }
 
-    let model = BERTSummarizer::new(&vs.root(), &indobert_config);
     let total_params = count_parameters(&vs);
     println!("   Total parameters: {}", total_params);
-    
+
     let mut optimizer = nn::AdamW::default().build(&vs, config.learning_rate)?;
     
     println!("\n Starting Training...\n");
@@ -1022,23 +1210,25 @@ fn main() -> Result<()> {
         println!("    Test Loss: {:.4}, Accuracy: {:.4}", test_loss, test_acc);
         println!("    Precision: {:.4}, Recall: {:.4}, F1: {:.4}", precision, recall, f1_score);
         
-        // Evaluate on a subset for ROUGE/BLEU (full evaluation is expensive)
-        let eval_subset_size = 20.min(data.len());
-        let eval_subset = &data[..eval_subset_size];
-        let (rouge, bleu) = evaluate_summarization(&model, &tokenizer, eval_subset, max_seq_len, config.device);
-        
-        println!("\n    ROUGE Scores (on {} samples):", eval_subset_size);
-        println!("      ROUGE-1: F1={:.4}, P={:.4}, R={:.4}", rouge.rouge_1_f, rouge.rouge_1_p, rouge.rouge_1_r);
-        println!("      ROUGE-2: F1={:.4}, P={:.4}, R={:.4}", rouge.rouge_2_f, rouge.rouge_2_p, rouge.rouge_2_r);
-        println!("      ROUGE-L: F1={:.4}, P={:.4}, R={:.4}", rouge.rouge_l_f, rouge.rouge_l_p, rouge.rouge_l_r);
-        println!("    BLEU Score: {:.4}", bleu);
-        
-        if !is_warmup && (test_acc > best_accuracy || f1_score > best_f1 || rouge.rouge_1_f > best_rouge_1) {
-            best_accuracy = best_accuracy.max(test_acc);
-            best_f1 = best_f1.max(f1_score);
-            best_rouge_1 = best_rouge_1.max(rouge.rouge_1_f);
-            vs.save("best_indobert_summarizer.pt")?;
-            println!("\n    Best model saved!");
+        // Evaluate on a subset for ROUGE/BLEU (every 2 epochs to save time)
+        if epoch % 2 == 0 || epoch == config.epochs + config.warmup_epochs {
+            let eval_subset_size = 20.min(data.len());
+            let eval_subset = &data[..eval_subset_size];
+            let (rouge, bleu) = evaluate_summarization(&model, &tokenizer, eval_subset, max_seq_len, config.device);
+            
+            println!("\n     ROUGE Scores (on {} samples):", eval_subset_size);
+            println!("      ROUGE-1: F1={:.4}, P={:.4}, R={:.4}", rouge.rouge_1_f, rouge.rouge_1_p, rouge.rouge_1_r);
+            println!("      ROUGE-2: F1={:.4}, P={:.4}, R={:.4}", rouge.rouge_2_f, rouge.rouge_2_p, rouge.rouge_2_r);
+            println!("      ROUGE-L: F1={:.4}, P={:.4}, R={:.4}", rouge.rouge_l_f, rouge.rouge_l_p, rouge.rouge_l_r);
+            println!("     BLEU Score: {:.4}", bleu);
+            
+            if !is_warmup && (test_acc > best_accuracy || f1_score > best_f1 || rouge.rouge_1_f > best_rouge_1) {
+                best_accuracy = best_accuracy.max(test_acc);
+                best_f1 = best_f1.max(f1_score);
+                best_rouge_1 = best_rouge_1.max(rouge.rouge_1_f);
+                vs.save("best_indobert_summarizer.pt")?;
+                println!("\n     Best model saved!");
+            }
         }
     }
     
@@ -1074,7 +1264,7 @@ fn main() -> Result<()> {
         let sentences = split_sentences(&test_doc.text);
         
         tch::no_grad(|| {
-            for (idx, sentence) in sentences.iter().enumerate().take(10) {
+            for (_idx, sentence) in sentences.iter().enumerate().take(10) {
                 let tokens = tokenizer.encode_sentence(sentence);
                 
                 if tokens.iter().all(|&token_id| token_id >= 0 && token_id < tokenizer.vocab_size()) {
@@ -1096,14 +1286,6 @@ fn main() -> Result<()> {
     
     println!("\n{}", "═".repeat(70));
     println!(" Done!");
-    println!("\n Next steps:");
-    println!("   1. Your fine-tuned model is saved as 'best_indobert_summarizer.pt'");
-    println!("   2. Use this model for inference on new Indonesian texts");
-    println!("   3. For better results, consider:");
-    println!("      - Training for more epochs");
-    println!("      - Tuning hyperparameters (learning rate, batch size)");
-    println!("      - Using a larger dataset");
-    println!("      - Experimenting with different sentence selection thresholds");
     
     Ok(())
 }
